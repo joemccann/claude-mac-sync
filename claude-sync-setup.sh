@@ -48,6 +48,170 @@ log_success() { echo -e "${GREEN}[OK]${NC} $1"; }
 log_warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# File Integrity Validation Functions
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Check if a file is empty
+is_file_empty() {
+    local file="$1"
+    [[ ! -s "$file" ]]
+}
+
+# Validate JSON file integrity
+validate_json_file() {
+    local file="$1"
+
+    # Check if file exists
+    if [[ ! -f "$file" ]]; then
+        return 1
+    fi
+
+    # Check if file is empty
+    if [[ ! -s "$file" ]]; then
+        return 1
+    fi
+
+    # Check JSON syntax using python3 (available on macOS)
+    if ! python3 -c "import json; json.load(open('$file'))" 2>/dev/null; then
+        return 1
+    fi
+
+    return 0
+}
+
+# Validate file copy integrity via checksum
+validate_file_copy() {
+    local src="$1"
+    local dst="$2"
+
+    if [[ ! -f "$src" || ! -f "$dst" ]]; then
+        return 1
+    fi
+
+    local src_sum dst_sum
+    src_sum=$(shasum -a 256 "$src" | cut -d' ' -f1)
+    dst_sum=$(shasum -a 256 "$dst" | cut -d' ' -f1)
+
+    [[ "$src_sum" == "$dst_sum" ]]
+}
+
+# Validate directory copy integrity
+validate_dir_copy() {
+    local src="$1"
+    local dst="$2"
+
+    if [[ ! -d "$src" || ! -d "$dst" ]]; then
+        return 1
+    fi
+
+    # Compare file counts
+    local src_count dst_count
+    src_count=$(find "$src" -type f | wc -l | tr -d ' ')
+    dst_count=$(find "$dst" -type f | wc -l | tr -d ' ')
+
+    if [[ "$src_count" != "$dst_count" ]]; then
+        return 1
+    fi
+
+    # Compare each file's checksum
+    while IFS= read -r -d '' file; do
+        local rel_path="${file#$src/}"
+        local dst_file="$dst/$rel_path"
+
+        if [[ ! -f "$dst_file" ]]; then
+            return 1
+        fi
+
+        if ! validate_file_copy "$file" "$dst_file"; then
+            return 1
+        fi
+    done < <(find "$src" -type f -print0)
+
+    return 0
+}
+
+# Copy file with integrity validation
+safe_copy_file() {
+    local src="$1"
+    local dst="$2"
+    local is_json="${3:-false}"
+
+    # Check source exists
+    if [[ ! -f "$src" ]]; then
+        log_error "Source file does not exist: $src"
+        return 1
+    fi
+
+    # Check source is not empty
+    if is_file_empty "$src"; then
+        log_error "Source file is empty (possibly Dropbox sync in progress): $src"
+        return 1
+    fi
+
+    # Validate JSON syntax if applicable
+    if [[ "$is_json" == "true" ]]; then
+        if ! validate_json_file "$src"; then
+            log_error "Source file has invalid JSON: $src"
+            return 1
+        fi
+    fi
+
+    # Perform the copy
+    cp -p "$src" "$dst"
+
+    # Validate the copy succeeded
+    if ! validate_file_copy "$src" "$dst"; then
+        log_error "Copy verification failed (checksum mismatch): $src -> $dst"
+        rm -f "$dst"
+        return 1
+    fi
+
+    return 0
+}
+
+# Copy directory with integrity validation
+safe_copy_dir() {
+    local src="$1"
+    local dst="$2"
+
+    # Check source exists
+    if [[ ! -d "$src" ]]; then
+        log_error "Source directory does not exist: $src"
+        return 1
+    fi
+
+    # Check for any empty files in source (sign of incomplete sync)
+    local empty_files
+    empty_files=$(find "$src" -type f -empty 2>/dev/null)
+    if [[ -n "$empty_files" ]]; then
+        log_error "Source directory contains empty files (possibly Dropbox sync in progress):"
+        echo "$empty_files" | head -5
+        return 1
+    fi
+
+    # Validate any JSON files in the source
+    while IFS= read -r -d '' json_file; do
+        if ! validate_json_file "$json_file"; then
+            log_error "Invalid JSON file in source directory: $json_file"
+            return 1
+        fi
+    done < <(find "$src" -type f -name "*.json" -print0)
+
+    # Perform the copy
+    rm -rf "$dst"
+    cp -rp "$src" "$dst"
+
+    # Validate the copy succeeded
+    if ! validate_dir_copy "$src" "$dst"; then
+        log_error "Directory copy verification failed: $src -> $dst"
+        rm -rf "$dst"
+        return 1
+    fi
+
+    return 0
+}
+
 confirm() {
     local prompt="$1"
     local response
@@ -162,6 +326,9 @@ create_backup() {
     cp -a "$CLAUDE_DIR" "$backup_path"
     log_success "Backup created: $backup_path"
 
+    # Save the backup path for undo capability
+    echo "$backup_path" > "$HOME/.claude_sync_last_backup"
+
     # Also update the "latest" backup symlink
     if [[ -L "$BACKUP_DIR" ]]; then
         rm -f "$BACKUP_DIR"
@@ -195,6 +362,7 @@ push_to_dropbox() {
 
     local copied=0
     local skipped=0
+    local failed=0
 
     # Copy files
     for file in "${SYNC_FILES[@]}"; do
@@ -208,9 +376,19 @@ push_to_dropbox() {
                 ((skipped++))
                 continue
             fi
-            cp -p "$src" "$dst"
-            log_success "Copied $file"
-            ((copied++))
+
+            # Determine if file is JSON
+            local is_json="false"
+            [[ "$file" == *.json ]] && is_json="true"
+
+            # Use safe copy with validation
+            if safe_copy_file "$src" "$dst" "$is_json"; then
+                log_success "Copied $file (verified)"
+                ((copied++))
+            else
+                log_error "Failed to copy $file"
+                ((failed++))
+            fi
         else
             log_warn "$file does not exist locally, skipping"
             ((skipped++))
@@ -229,10 +407,15 @@ push_to_dropbox() {
                 ((skipped++))
                 continue
             fi
-            rm -rf "$dst"
-            cp -rp "$src" "$dst"
-            log_success "Copied $dir/"
-            ((copied++))
+
+            # Use safe copy with validation
+            if safe_copy_dir "$src" "$dst"; then
+                log_success "Copied $dir/ (verified)"
+                ((copied++))
+            else
+                log_error "Failed to copy $dir/"
+                ((failed++))
+            fi
         else
             log_warn "$dir/ does not exist locally, skipping"
             ((skipped++))
@@ -240,8 +423,13 @@ push_to_dropbox() {
     done
 
     echo ""
-    log_success "Push complete. Copied: $copied, Skipped: $skipped"
-    log_info "Files are now in: $DROPBOX_CLAUDE_DIR"
+    if [[ $failed -gt 0 ]]; then
+        log_error "Push completed with errors. Copied: $copied, Skipped: $skipped, Failed: $failed"
+        return 1
+    else
+        log_success "Push complete. Copied: $copied, Skipped: $skipped (all verified)"
+        log_info "Files are now in: $DROPBOX_CLAUDE_DIR"
+    fi
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -260,6 +448,56 @@ pull_from_dropbox() {
         exit 1
     fi
 
+    # Pre-flight validation: check all source files before making any changes
+    log_info "Validating source files..."
+    local validation_failed=0
+
+    for file in "${SYNC_FILES[@]}"; do
+        local src="$DROPBOX_CLAUDE_DIR/$file"
+        if [[ -f "$src" ]]; then
+            if is_file_empty "$src"; then
+                log_error "$file is empty (Dropbox may still be syncing)"
+                ((validation_failed++))
+            elif [[ "$file" == *.json ]]; then
+                if ! validate_json_file "$src"; then
+                    log_error "$file has invalid JSON content"
+                    ((validation_failed++))
+                fi
+            fi
+        fi
+    done
+
+    for dir in "${SYNC_DIRS[@]}"; do
+        local src="$DROPBOX_CLAUDE_DIR/$dir"
+        if [[ -d "$src" ]]; then
+            local empty_files
+            empty_files=$(find "$src" -type f -empty 2>/dev/null)
+            if [[ -n "$empty_files" ]]; then
+                log_error "$dir/ contains empty files (Dropbox may still be syncing)"
+                ((validation_failed++))
+            fi
+
+            # Check JSON files in directory
+            while IFS= read -r -d '' json_file; do
+                if ! validate_json_file "$json_file"; then
+                    log_error "Invalid JSON in $dir/: ${json_file##*/}"
+                    ((validation_failed++))
+                fi
+            done < <(find "$src" -type f -name "*.json" -print0 2>/dev/null)
+        fi
+    done
+
+    if [[ $validation_failed -gt 0 ]]; then
+        echo ""
+        log_error "Pre-flight validation failed with $validation_failed error(s)."
+        log_error "Please wait for Dropbox to finish syncing and try again."
+        log_info "Tip: Check Dropbox menu bar icon for sync status."
+        exit 1
+    fi
+
+    log_success "All source files validated"
+    echo ""
+
     # Create backup first
     create_backup
 
@@ -268,6 +506,7 @@ pull_from_dropbox() {
 
     local copied=0
     local skipped=0
+    local failed=0
 
     # Copy files
     for file in "${SYNC_FILES[@]}"; do
@@ -280,9 +519,19 @@ pull_from_dropbox() {
                 rm -f "$dst"
                 log_info "Removed old symlink: $file"
             fi
-            cp -p "$src" "$dst"
-            log_success "Copied $file"
-            ((copied++))
+
+            # Determine if file is JSON
+            local is_json="false"
+            [[ "$file" == *.json ]] && is_json="true"
+
+            # Use safe copy with validation
+            if safe_copy_file "$src" "$dst" "$is_json"; then
+                log_success "Copied $file (verified)"
+                ((copied++))
+            else
+                log_error "Failed to copy $file"
+                ((failed++))
+            fi
         else
             log_warn "$file does not exist in Dropbox, skipping"
             ((skipped++))
@@ -300,10 +549,15 @@ pull_from_dropbox() {
                 rm -f "$dst"
                 log_info "Removed old symlink: $dir/"
             fi
-            rm -rf "$dst"
-            cp -rp "$src" "$dst"
-            log_success "Copied $dir/"
-            ((copied++))
+
+            # Use safe copy with validation
+            if safe_copy_dir "$src" "$dst"; then
+                log_success "Copied $dir/ (verified)"
+                ((copied++))
+            else
+                log_error "Failed to copy $dir/"
+                ((failed++))
+            fi
         else
             log_warn "$dir/ does not exist in Dropbox, skipping"
             ((skipped++))
@@ -311,7 +565,129 @@ pull_from_dropbox() {
     done
 
     echo ""
-    log_success "Pull complete. Copied: $copied, Skipped: $skipped"
+    if [[ $failed -gt 0 ]]; then
+        log_error "Pull completed with errors. Copied: $copied, Skipped: $skipped, Failed: $failed"
+        log_info "Your previous config was backed up. Check the backup if needed."
+        return 1
+    else
+        log_success "Pull complete. Copied: $copied, Skipped: $skipped (all verified)"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Undo: Restore previous state after a pull
+# ─────────────────────────────────────────────────────────────────────────────
+
+LAST_BACKUP_FILE="$HOME/.claude_sync_last_backup"
+
+undo_pull() {
+    if [[ ! -f "$LAST_BACKUP_FILE" ]]; then
+        log_error "No recent pull to undo."
+        log_info "Run --backups to see available backups."
+        exit 1
+    fi
+
+    local backup_path
+    backup_path=$(cat "$LAST_BACKUP_FILE")
+
+    if [[ ! -d "$backup_path" ]]; then
+        log_error "Backup not found: $backup_path"
+        log_info "Run --backups to see available backups."
+        exit 1
+    fi
+
+    log_warn "This will restore ~/.claude from:"
+    echo "  $backup_path"
+    echo ""
+
+    if ! confirm "Proceed with undo?"; then
+        log_info "Aborted."
+        exit 0
+    fi
+
+    # Remove current and restore from backup
+    rm -rf "$CLAUDE_DIR"
+    cp -a "$backup_path" "$CLAUDE_DIR"
+
+    # Remove the last backup marker (can't undo twice)
+    rm -f "$LAST_BACKUP_FILE"
+
+    log_success "Restored from $backup_path"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# List Backups: Show all available backups
+# ─────────────────────────────────────────────────────────────────────────────
+
+list_backups() {
+    echo ""
+    echo -e "${CYAN}Available backups:${NC}"
+    local found=0
+
+    for backup in "$HOME"/.claude_backup.*; do
+        if [[ -d "$backup" ]]; then
+            local timestamp="${backup##*.claude_backup.}"
+            local formatted
+            # Try to format the timestamp nicely
+            if [[ "$timestamp" =~ ^[0-9]{8}_[0-9]{6}$ ]]; then
+                local date_part="${timestamp:0:4}-${timestamp:4:2}-${timestamp:6:2}"
+                local time_part="${timestamp:9:2}:${timestamp:11:2}:${timestamp:13:2}"
+                formatted="$date_part $time_part"
+            else
+                formatted="$timestamp"
+            fi
+            echo -e "  ${GREEN}$formatted${NC}  ->  $backup"
+            ((found++))
+        fi
+    done
+
+    if [[ $found -eq 0 ]]; then
+        echo "  (no backups found)"
+    else
+        echo ""
+        log_info "To restore a specific backup, run:"
+        echo "  $0 --restore <backup_path>"
+    fi
+    echo ""
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Restore: Restore from a specific backup
+# ─────────────────────────────────────────────────────────────────────────────
+
+restore_backup() {
+    local backup_path="$1"
+
+    if [[ -z "$backup_path" ]]; then
+        log_error "Usage: $0 --restore <backup_path>"
+        echo ""
+        list_backups
+        exit 1
+    fi
+
+    if [[ ! -d "$backup_path" ]]; then
+        log_error "Backup not found: $backup_path"
+        list_backups
+        exit 1
+    fi
+
+    log_warn "This will restore ~/.claude from:"
+    echo "  $backup_path"
+    echo ""
+
+    if ! confirm "Proceed with restore?"; then
+        log_info "Aborted."
+        exit 0
+    fi
+
+    # Create a backup of current state first
+    create_backup
+
+    # Restore
+    rm -rf "$CLAUDE_DIR"
+    cp -a "$backup_path" "$CLAUDE_DIR"
+
+    log_success "Restored from $backup_path"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -411,14 +787,17 @@ show_status() {
 
 usage() {
     cat << EOF
-Usage: $0 [--push | --pull | --status | --config | --backup]
+Usage: $0 [--push | --pull | --status | --config | --backup | --undo | --backups | --restore <path>]
 
 Options:
-  --push      Copy ~/.claude files TO Dropbox (overwrites Dropbox)
-  --pull      Copy Dropbox files TO ~/.claude (overwrites local)
-  --status    Show sync status and file differences
-  --config    Reconfigure Dropbox folder location
-  --backup    Create timestamped backup of ~/.claude
+  --push           Copy ~/.claude files TO Dropbox (overwrites Dropbox)
+  --pull           Copy Dropbox files TO ~/.claude (overwrites local)
+  --status         Show sync status and file differences
+  --config         Reconfigure Dropbox folder location
+  --backup         Create timestamped backup of ~/.claude
+  --undo           Restore previous state after a pull
+  --backups        List all available backups
+  --restore <path> Restore from a specific backup
 
 Workflow:
   1. On primary machine:   ./claude-sync-setup.sh --push
@@ -427,6 +806,7 @@ Workflow:
   4. Check status anytime: ./claude-sync-setup.sh --status
 
 After initial setup, use --push/--pull to sync changes between machines.
+Use --undo immediately after a pull to revert to your previous state.
 EOF
 }
 
@@ -461,6 +841,15 @@ main() {
             ;;
         --backup)
             create_backup
+            ;;
+        --undo)
+            undo_pull
+            ;;
+        --backups)
+            list_backups
+            ;;
+        --restore)
+            restore_backup "${2:-}"
             ;;
         --help|-h|"")
             usage

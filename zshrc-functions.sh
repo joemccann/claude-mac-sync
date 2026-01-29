@@ -9,6 +9,94 @@ CLAUDE_SYNC_LOCAL_DIR="$HOME/.claude"
 CLAUDE_SYNC_FILES=("settings.json" "mcp.json" "CLAUDE.md")
 CLAUDE_SYNC_DIRS=("skills" "plugins")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# File Integrity Validation Functions
+# ─────────────────────────────────────────────────────────────────────────────
+
+_claude_sync_is_file_empty() {
+    [[ ! -s "$1" ]]
+}
+
+_claude_sync_validate_json() {
+    local file="$1"
+    [[ -f "$file" && -s "$file" ]] && python3 -c "import json; json.load(open('$file'))" 2>/dev/null
+}
+
+_claude_sync_validate_copy() {
+    local src="$1" dst="$2"
+    [[ -f "$src" && -f "$dst" ]] && [[ "$(shasum -a 256 "$src" | cut -d' ' -f1)" == "$(shasum -a 256 "$dst" | cut -d' ' -f1)" ]]
+}
+
+_claude_sync_validate_dir() {
+    local src="$1" dst="$2"
+    [[ -d "$src" && -d "$dst" ]] || return 1
+    local src_count=$(find "$src" -type f | wc -l | tr -d ' ')
+    local dst_count=$(find "$dst" -type f | wc -l | tr -d ' ')
+    [[ "$src_count" == "$dst_count" ]]
+}
+
+_claude_sync_safe_copy_file() {
+    local src="$1" dst="$2" is_json="${3:-false}"
+
+    if [[ ! -f "$src" ]]; then
+        echo "\033[0;31m[ERROR]\033[0m Source does not exist: $src"
+        return 1
+    fi
+
+    if _claude_sync_is_file_empty "$src"; then
+        echo "\033[0;31m[ERROR]\033[0m Source is empty (Dropbox syncing?): $src"
+        return 1
+    fi
+
+    if [[ "$is_json" == "true" ]] && ! _claude_sync_validate_json "$src"; then
+        echo "\033[0;31m[ERROR]\033[0m Invalid JSON: $src"
+        return 1
+    fi
+
+    cp -p "$src" "$dst"
+
+    if ! _claude_sync_validate_copy "$src" "$dst"; then
+        echo "\033[0;31m[ERROR]\033[0m Copy verification failed: $src"
+        rm -f "$dst"
+        return 1
+    fi
+    return 0
+}
+
+_claude_sync_safe_copy_dir() {
+    local src="$1" dst="$2"
+
+    if [[ ! -d "$src" ]]; then
+        echo "\033[0;31m[ERROR]\033[0m Source dir does not exist: $src"
+        return 1
+    fi
+
+    # Check for empty files
+    local empty_files=$(find "$src" -type f -empty 2>/dev/null)
+    if [[ -n "$empty_files" ]]; then
+        echo "\033[0;31m[ERROR]\033[0m Source contains empty files (Dropbox syncing?)"
+        return 1
+    fi
+
+    # Validate JSON files
+    while IFS= read -r -d '' json_file; do
+        if ! _claude_sync_validate_json "$json_file"; then
+            echo "\033[0;31m[ERROR]\033[0m Invalid JSON in source: ${json_file##*/}"
+            return 1
+        fi
+    done < <(find "$src" -type f -name "*.json" -print0 2>/dev/null)
+
+    rm -rf "$dst"
+    cp -rp "$src" "$dst"
+
+    if ! _claude_sync_validate_dir "$src" "$dst"; then
+        echo "\033[0;31m[ERROR]\033[0m Directory copy verification failed"
+        rm -rf "$dst"
+        return 1
+    fi
+    return 0
+}
+
 # Load Dropbox location from config or use default
 _claude_sync_load_config() {
     if [[ -f "$CLAUDE_SYNC_CONFIG_FILE" ]]; then
@@ -96,22 +184,39 @@ claude-sync-push() {
 
     mkdir -p "$CLAUDE_SYNC_DROPBOX_DIR"
 
+    local failed=0
+
     for file in "${CLAUDE_SYNC_FILES[@]}"; do
         local src="$CLAUDE_SYNC_LOCAL_DIR/$file"
+        local dst="$CLAUDE_SYNC_DROPBOX_DIR/$file"
         if [[ -f "$src" && ! -L "$src" ]]; then
-            cp -p "$src" "$CLAUDE_SYNC_DROPBOX_DIR/$file"
-            echo "\033[0;32m[PUSHED]\033[0m $file"
+            local is_json="false"
+            [[ "$file" == *.json ]] && is_json="true"
+
+            if _claude_sync_safe_copy_file "$src" "$dst" "$is_json"; then
+                echo "\033[0;32m[PUSHED]\033[0m $file (verified)"
+            else
+                ((failed++))
+            fi
         fi
     done
 
     for dir in "${CLAUDE_SYNC_DIRS[@]}"; do
         local src="$CLAUDE_SYNC_LOCAL_DIR/$dir"
+        local dst="$CLAUDE_SYNC_DROPBOX_DIR/$dir"
         if [[ -d "$src" && ! -L "$src" ]]; then
-            rm -rf "$CLAUDE_SYNC_DROPBOX_DIR/$dir"
-            cp -rp "$src" "$CLAUDE_SYNC_DROPBOX_DIR/$dir"
-            echo "\033[0;32m[PUSHED]\033[0m $dir/"
+            if _claude_sync_safe_copy_dir "$src" "$dst"; then
+                echo "\033[0;32m[PUSHED]\033[0m $dir/ (verified)"
+            else
+                ((failed++))
+            fi
         fi
     done
+
+    if [[ $failed -gt 0 ]]; then
+        echo "\033[0;31m[ERROR]\033[0m Push completed with $failed error(s)"
+        return 1
+    fi
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -125,15 +230,68 @@ claude-sync-pull() {
         return 1
     fi
 
+    # Pre-flight validation
+    echo "\033[0;34m[INFO]\033[0m Validating source files..."
+    local validation_failed=0
+
+    for file in "${CLAUDE_SYNC_FILES[@]}"; do
+        local src="$CLAUDE_SYNC_DROPBOX_DIR/$file"
+        if [[ -f "$src" ]]; then
+            if _claude_sync_is_file_empty "$src"; then
+                echo "\033[0;31m[ERROR]\033[0m $file is empty (Dropbox syncing?)"
+                ((validation_failed++))
+            elif [[ "$file" == *.json ]] && ! _claude_sync_validate_json "$src"; then
+                echo "\033[0;31m[ERROR]\033[0m $file has invalid JSON"
+                ((validation_failed++))
+            fi
+        fi
+    done
+
+    for dir in "${CLAUDE_SYNC_DIRS[@]}"; do
+        local src="$CLAUDE_SYNC_DROPBOX_DIR/$dir"
+        if [[ -d "$src" ]]; then
+            local empty_files=$(find "$src" -type f -empty 2>/dev/null)
+            if [[ -n "$empty_files" ]]; then
+                echo "\033[0;31m[ERROR]\033[0m $dir/ contains empty files (Dropbox syncing?)"
+                ((validation_failed++))
+            fi
+        fi
+    done
+
+    if [[ $validation_failed -gt 0 ]]; then
+        echo "\033[0;31m[ERROR]\033[0m Validation failed. Wait for Dropbox to finish syncing."
+        return 1
+    fi
+
+    # Create backup before pull for undo capability
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local backup_path="$HOME/.claude_backup.$timestamp"
+    if [[ -d "$CLAUDE_SYNC_LOCAL_DIR" ]]; then
+        cp -a "$CLAUDE_SYNC_LOCAL_DIR" "$backup_path"
+        echo "\033[0;34m[INFO]\033[0m Backup created: $backup_path"
+
+        # Update last backup marker for undo
+        echo "$backup_path" > "$HOME/.claude_sync_last_backup"
+    fi
+
     mkdir -p "$CLAUDE_SYNC_LOCAL_DIR"
+
+    local failed=0
 
     for file in "${CLAUDE_SYNC_FILES[@]}"; do
         local src="$CLAUDE_SYNC_DROPBOX_DIR/$file"
         local dst="$CLAUDE_SYNC_LOCAL_DIR/$file"
         if [[ -f "$src" ]]; then
             [[ -L "$dst" ]] && rm -f "$dst"
-            cp -p "$src" "$dst"
-            echo "\033[0;32m[PULLED]\033[0m $file"
+
+            local is_json="false"
+            [[ "$file" == *.json ]] && is_json="true"
+
+            if _claude_sync_safe_copy_file "$src" "$dst" "$is_json"; then
+                echo "\033[0;32m[PULLED]\033[0m $file (verified)"
+            else
+                ((failed++))
+            fi
         fi
     done
 
@@ -142,11 +300,142 @@ claude-sync-pull() {
         local dst="$CLAUDE_SYNC_LOCAL_DIR/$dir"
         if [[ -d "$src" ]]; then
             [[ -L "$dst" ]] && rm -f "$dst"
-            rm -rf "$dst"
-            cp -rp "$src" "$dst"
-            echo "\033[0;32m[PULLED]\033[0m $dir/"
+
+            if _claude_sync_safe_copy_dir "$src" "$dst"; then
+                echo "\033[0;32m[PULLED]\033[0m $dir/ (verified)"
+            else
+                ((failed++))
+            fi
         fi
     done
+
+    if [[ $failed -gt 0 ]]; then
+        echo "\033[0;31m[ERROR]\033[0m Pull completed with $failed error(s)"
+        echo "\033[1;33m[HINT]\033[0m Run 'claude-sync-undo' to restore previous state"
+        return 1
+    else
+        echo "\033[0;32m[OK]\033[0m Pull complete. Run 'claude-sync-undo' to revert if needed."
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# claude-sync-undo: Restore previous state after a pull
+# ─────────────────────────────────────────────────────────────────────────────
+claude-sync-undo() {
+    local last_backup_file="$HOME/.claude_sync_last_backup"
+
+    if [[ ! -f "$last_backup_file" ]]; then
+        echo "\033[0;31m[ERROR]\033[0m No recent pull to undo."
+        echo "Run 'claude-sync-backups' to see available backups."
+        return 1
+    fi
+
+    local backup_path
+    backup_path=$(cat "$last_backup_file")
+
+    if [[ ! -d "$backup_path" ]]; then
+        echo "\033[0;31m[ERROR]\033[0m Backup not found: $backup_path"
+        echo "Run 'claude-sync-backups' to see available backups."
+        return 1
+    fi
+
+    echo "\033[1;33mThis will restore ~/.claude from:\033[0m"
+    echo "  $backup_path"
+    echo ""
+    echo -n "\033[1;33mProceed? [y/N]:\033[0m "
+    read -r response
+
+    if [[ ! "$response" =~ ^[Yy]$ ]]; then
+        echo "Aborted."
+        return 0
+    fi
+
+    # Remove current and restore from backup
+    rm -rf "$CLAUDE_SYNC_LOCAL_DIR"
+    cp -a "$backup_path" "$CLAUDE_SYNC_LOCAL_DIR"
+
+    # Remove the last backup marker (can't undo twice)
+    rm -f "$last_backup_file"
+
+    echo "\033[0;32m[OK]\033[0m Restored from $backup_path"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# claude-sync-backups: List available backups
+# ─────────────────────────────────────────────────────────────────────────────
+claude-sync-backups() {
+    echo "\033[0;36mAvailable backups:\033[0m"
+    local found=0
+
+    for backup in "$HOME"/.claude_backup.*; do
+        if [[ -d "$backup" ]]; then
+            local timestamp="${backup##*.claude_backup.}"
+            local formatted
+            # Try to format the timestamp nicely
+            if [[ "$timestamp" =~ ^[0-9]{8}_[0-9]{6}$ ]]; then
+                local date_part="${timestamp:0:4}-${timestamp:4:2}-${timestamp:6:2}"
+                local time_part="${timestamp:9:2}:${timestamp:11:2}:${timestamp:13:2}"
+                formatted="$date_part $time_part"
+            else
+                formatted="$timestamp"
+            fi
+            echo "  $formatted  ->  $backup"
+            ((found++))
+        fi
+    done
+
+    if [[ $found -eq 0 ]]; then
+        echo "  (no backups found)"
+    else
+        echo ""
+        echo "To restore a specific backup, run:"
+        echo "  rm -rf ~/.claude && cp -a <backup_path> ~/.claude"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# claude-sync-restore: Restore from a specific backup
+# ─────────────────────────────────────────────────────────────────────────────
+claude-sync-restore() {
+    local backup_path="$1"
+
+    if [[ -z "$backup_path" ]]; then
+        echo "Usage: claude-sync-restore <backup_path>"
+        echo ""
+        echo "Available backups:"
+        claude-sync-backups
+        return 1
+    fi
+
+    if [[ ! -d "$backup_path" ]]; then
+        echo "\033[0;31m[ERROR]\033[0m Backup not found: $backup_path"
+        return 1
+    fi
+
+    echo "\033[1;33mThis will restore ~/.claude from:\033[0m"
+    echo "  $backup_path"
+    echo ""
+    echo -n "\033[1;33mProceed? [y/N]:\033[0m "
+    read -r response
+
+    if [[ ! "$response" =~ ^[Yy]$ ]]; then
+        echo "Aborted."
+        return 0
+    fi
+
+    # Create a backup of current state first
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local current_backup="$HOME/.claude_backup.$timestamp"
+    if [[ -d "$CLAUDE_SYNC_LOCAL_DIR" ]]; then
+        cp -a "$CLAUDE_SYNC_LOCAL_DIR" "$current_backup"
+        echo "\033[0;34m[INFO]\033[0m Current state backed up to: $current_backup"
+    fi
+
+    # Restore
+    rm -rf "$CLAUDE_SYNC_LOCAL_DIR"
+    cp -a "$backup_path" "$CLAUDE_SYNC_LOCAL_DIR"
+
+    echo "\033[0;32m[OK]\033[0m Restored from $backup_path"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -63,6 +63,9 @@ chmod +x claude-sync-setup.sh
 | `--status` | Show sync status and file differences |
 | `--config` | Configure/reconfigure Dropbox folder location |
 | `--backup` | Create timestamped backup of `~/.claude` |
+| `--undo` | Restore previous state after a pull |
+| `--backups` | List all available backups |
+| `--restore <path>` | Restore from a specific backup |
 
 ---
 
@@ -137,6 +140,9 @@ source /path/to/claude-mac-sync/zshrc-functions.sh
 | `claude-sync-status` | Quick status check |
 | `claude-sync-push` | Quick push to Dropbox |
 | `claude-sync-pull` | Quick pull from Dropbox |
+| `claude-sync-undo` | Restore previous state after a pull |
+| `claude-sync-backups` | List all available backups |
+| `claude-sync-restore <path>` | Restore from a specific backup |
 | `claude-sync-conflicts` | List Dropbox conflicts |
 
 ---
@@ -192,8 +198,31 @@ Manual backup:
 
 Restore from backup:
 ```bash
-cp -a ~/.claude_backup.TIMESTAMP/* ~/.claude/
+# Undo the most recent pull
+./claude-sync-setup.sh --undo
+
+# Or use shell function
+claude-sync-undo
+
+# List all backups
+./claude-sync-setup.sh --backups
+
+# Restore from a specific backup
+./claude-sync-setup.sh --restore ~/.claude_backup.20250128_143022
 ```
+
+---
+
+## File Integrity
+
+The sync scripts validate all files before and after copying to prevent corruption:
+
+- **Empty file detection**: Rejects empty files (often caused by Dropbox sync in progress)
+- **JSON validation**: Validates JSON syntax for `settings.json` and `mcp.json`
+- **Checksum verification**: Verifies SHA-256 checksums after every copy operation
+- **Directory validation**: Ensures all files in directories are copied correctly
+
+If validation fails, the operation is aborted and your original files remain unchanged.
 
 ---
 
@@ -228,3 +257,5 @@ Run `--pull` to replace symlinks with real files.
 | `zshrc-functions.sh` | Shell functions for quick access |
 | `~/.claude_sync_config` | Saved Dropbox location (per-machine) |
 | `~/.claude_backup.*` | Timestamped backups |
+| `~/.claude_sync_last_backup` | Marker for undo functionality |
+| `test_sync.sh` | Test suite for integrity validation |
