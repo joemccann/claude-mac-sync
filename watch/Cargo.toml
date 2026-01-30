@@ -1,0 +1,23 @@
+[package]
+name = "claude-sync-watch"
+version = "0.1.0"
+edition = "2021"
+description = "Two-way file watching sync daemon for Claude Code configuration"
+authors = ["Joe McCann"]
+
+[dependencies]
+notify = "6"           # File system watching (cross-platform)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"       # JSON state files
+sha2 = "0.10"          # SHA-256 checksums
+chrono = { version = "0.4", features = ["serde"] }  # Timestamps
+dirs = "5"             # Home directory
+anyhow = "1"           # Error handling
+log = "0.4"            # Logging facade
+env_logger = "0.11"    # Logger implementation
+clap = { version = "4", features = ["derive"] }  # CLI
+hostname = "0.4"       # Get machine ID
+
+[profile.release]
+opt-level = 3
+lto = true

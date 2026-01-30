@@ -4,7 +4,9 @@ Synchronize `~/.claude` configuration files between multiple Macs using Dropbox 
 
 ## Overview
 
-This solution copies Claude Code configuration files to a shared Dropbox location, enabling synchronization between machines using `--push` and `--pull` commands.
+This solution provides two sync modes:
+1. **Manual sync**: Push/pull commands for on-demand synchronization
+2. **Auto sync**: File watching daemon for automatic bidirectional sync
 
 **Synchronized Items:**
 - `settings.json` - Claude Code settings
@@ -13,7 +15,15 @@ This solution copies Claude Code configuration files to a shared Dropbox locatio
 - `skills/` - Custom skills directory
 - `plugins/` - Plugins directory
 
-**Architecture:**
+**Architecture (with auto-sync daemon):**
+```
+Machine A                          Dropbox                         Machine B
+~/.claude/  <->  claude-sync-watch  <->  ClaudeCodeSync/  <->  claude-sync-watch  <->  ~/.claude/
+                    (daemon)              .sync_state.json         (daemon)
+                                          .sync_lock
+```
+
+**Manual sync architecture:**
 ```
 Machine A                          Machine B
 ~/.claude/                         ~/.claude/
@@ -38,6 +48,29 @@ Machine A                          Machine B
 
 ## Quick Start
 
+### Automatic Sync (Recommended)
+
+Install the file watcher daemon for automatic bidirectional sync:
+
+```bash
+# Build and install the daemon (requires Rust)
+./claude-sync-setup.sh --watch-install
+
+# Check status
+./claude-sync-setup.sh --watch-status
+
+# Follow logs
+./claude-sync-setup.sh --watch-logs
+```
+
+The daemon will:
+- Watch both `~/.claude` and the Dropbox sync folder
+- Automatically sync changes in both directions
+- Create backups before every sync
+- Validate files before copying (prevents syncing empty/corrupted files)
+
+### Manual Sync
+
 ```bash
 # Make executable
 chmod +x claude-sync-setup.sh
@@ -56,6 +89,8 @@ chmod +x claude-sync-setup.sh
 
 ## Commands
 
+### Manual Sync Commands
+
 | Command | Description |
 |---------|-------------|
 | `--push` | Copy `~/.claude` files TO Dropbox (overwrites Dropbox) |
@@ -66,6 +101,24 @@ chmod +x claude-sync-setup.sh
 | `--undo` | Restore previous state after a pull |
 | `--backups` | List all available backups |
 | `--restore <path>` | Restore from a specific backup |
+
+### Watch Daemon Commands
+
+| Command | Description |
+|---------|-------------|
+| `--watch-install` | Build and install the watch daemon (requires Rust) |
+| `--watch-start` | Start the watch daemon |
+| `--watch-stop` | Stop the watch daemon |
+| `--watch-restart` | Restart the watch daemon |
+| `--watch-status` | Show daemon status and sync info |
+| `--watch-logs` | Follow daemon logs in real-time |
+| `--watch-build` | Build the Rust binary only |
+
+You can also use `claude-sync-daemon.sh` directly:
+```bash
+./claude-sync-daemon.sh once      # One-time sync (no watching)
+./claude-sync-daemon.sh validate  # Validate configuration
+```
 
 ---
 
@@ -133,7 +186,7 @@ Add quick-access functions to your shell:
 source /path/to/claude-mac-sync/zshrc-functions.sh
 ```
 
-**Available Commands:**
+**Manual Sync Commands:**
 
 | Command | Description |
 |---------|-------------|
@@ -144,6 +197,18 @@ source /path/to/claude-mac-sync/zshrc-functions.sh
 | `claude-sync-backups` | List all available backups |
 | `claude-sync-restore <path>` | Restore from a specific backup |
 | `claude-sync-conflicts` | List Dropbox conflicts |
+
+**Watch Daemon Commands:**
+
+| Command | Description |
+|---------|-------------|
+| `claude-sync-watch <cmd>` | Control the watch daemon |
+| `claude-watch-start` | Start the watch daemon |
+| `claude-watch-stop` | Stop the watch daemon |
+| `claude-watch-restart` | Restart the watch daemon |
+| `claude-watch-status` | Show daemon status |
+| `claude-watch-logs` | Follow daemon logs |
+| `claude-watch-install` | Install the daemon |
 
 ---
 
@@ -254,8 +319,131 @@ Run `--pull` to replace symlinks with real files.
 | File | Purpose |
 |------|---------|
 | `claude-sync-setup.sh` | Main sync script |
+| `claude-sync-daemon.sh` | Daemon control script |
 | `zshrc-functions.sh` | Shell functions for quick access |
+| `watch/` | Rust source for file watcher daemon |
 | `~/.claude_sync_config` | Saved Dropbox location (per-machine) |
 | `~/.claude_backup.*` | Timestamped backups |
 | `~/.claude_sync_last_backup` | Marker for undo functionality |
+| `~/.claude_sync_logs/` | Daemon log files |
 | `test_sync.sh` | Test suite for integrity validation |
+
+---
+
+## Watch Daemon
+
+The watch daemon is a Rust application that provides automatic bidirectional sync.
+
+### Prerequisites
+
+- [Rust](https://rustup.rs) toolchain for building
+
+### Installation
+
+```bash
+# Build and install (one command)
+./claude-sync-daemon.sh install
+
+# Or step by step:
+./claude-sync-daemon.sh build
+./claude-sync-daemon.sh install
+```
+
+This will:
+1. Build the Rust binary
+2. Create a launchd agent plist
+3. Start the daemon
+
+The daemon starts automatically on login.
+
+### Configuration
+
+The daemon reads configuration from `~/.claude_sync_config`:
+
+```bash
+DROPBOX_BASE="/path/to/Dropbox"
+DEBOUNCE_SECS="3.0"       # Wait time before syncing (default: 3s)
+MAX_BATCH_SECS="10.0"     # Max time to batch changes (default: 10s)
+CONFLICT_STRATEGY="newest" # newest, local, or remote
+LOG_LEVEL="info"          # debug, info, warn, error
+```
+
+### Features
+
+- **Debouncing**: Waits 3 seconds after the last change before syncing
+- **Batch mode**: Batches rapid changes (max 10 seconds)
+- **Distributed lock**: Prevents concurrent syncs across machines
+- **Backup first**: Creates a backup before every sync operation
+- **File validation**: Rejects empty files and invalid JSON
+- **Checksum verification**: Verifies SHA-256 after every copy
+
+### Log Files
+
+```bash
+# View daemon logs
+./claude-sync-daemon.sh logs
+
+# Follow logs in real-time
+./claude-sync-daemon.sh follow
+
+# Log location
+~/.claude_sync_logs/sync-watch.log
+~/.claude_sync_logs/sync-watch.err
+```
+
+### Uninstall
+
+```bash
+./claude-sync-daemon.sh uninstall
+```
+
+### Troubleshooting the Daemon
+
+**Daemon won't start**
+```bash
+# Check if already running
+./claude-sync-daemon.sh status
+
+# Check for errors
+cat ~/.claude_sync_logs/sync-watch.err
+
+# Verify configuration
+./watch/target/release/claude-sync-watch --validate
+```
+
+**"Sync locked by another machine"**
+
+The lock auto-expires after 60 seconds. If a machine crashed while holding the lock:
+```bash
+# Wait 60 seconds, or manually remove the lock
+rm ~/Dropbox/ClaudeCodeSync/.sync_lock
+```
+
+**Validation errors (empty files)**
+
+This usually means Dropbox is still syncing:
+```bash
+# Check Dropbox status in menu bar
+# Wait for sync to complete, then try again
+./claude-sync-daemon.sh restart
+```
+
+**Daemon keeps restarting**
+
+Check for configuration issues:
+```bash
+# View error log
+cat ~/.claude_sync_logs/sync-watch.err
+
+# Common issues:
+# - Dropbox folder doesn't exist
+# - ~/.claude_sync_config has wrong path
+# - Permission issues
+```
+
+**Changes not syncing**
+
+1. Check daemon is running: `./claude-sync-daemon.sh status`
+2. Check logs for errors: `./claude-sync-daemon.sh logs`
+3. Verify Dropbox is syncing (check menu bar icon)
+4. Try manual sync: `./claude-sync-daemon.sh once`

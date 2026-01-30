@@ -8,3 +8,7 @@
 
 # Session files
 CONTINUITY.md
+
+# Rust build artifacts
+watch/target/
+watch/Cargo.lock

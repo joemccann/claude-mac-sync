@@ -788,6 +788,7 @@ show_status() {
 usage() {
     cat << EOF
 Usage: $0 [--push | --pull | --status | --config | --backup | --undo | --backups | --restore <path>]
+       $0 [--watch-start | --watch-stop | --watch-status | --watch-install]
 
 Options:
   --push           Copy ~/.claude files TO Dropbox (overwrites Dropbox)
@@ -799,15 +800,41 @@ Options:
   --backups        List all available backups
   --restore <path> Restore from a specific backup
 
+Watch Daemon (automatic two-way sync):
+  --watch-install  Build and install the watch daemon
+  --watch-start    Start the watch daemon
+  --watch-stop     Stop the watch daemon
+  --watch-status   Show watch daemon status
+  --watch-logs     Follow daemon logs
+
 Workflow:
   1. On primary machine:   ./claude-sync-setup.sh --push
   2. Wait for Dropbox to sync
   3. On secondary machine: ./claude-sync-setup.sh --pull
   4. Check status anytime: ./claude-sync-setup.sh --status
 
+For automatic two-way sync:
+  1. Install daemon:  ./claude-sync-setup.sh --watch-install
+  2. Check status:    ./claude-sync-setup.sh --watch-status
+  3. View logs:       ./claude-sync-setup.sh --watch-logs
+
 After initial setup, use --push/--pull to sync changes between machines.
 Use --undo immediately after a pull to revert to your previous state.
 EOF
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Watch Daemon Commands
+# ─────────────────────────────────────────────────────────────────────────────
+
+DAEMON_SCRIPT="$(dirname "${BASH_SOURCE[0]}")/claude-sync-daemon.sh"
+
+run_daemon_cmd() {
+    if [[ ! -f "$DAEMON_SCRIPT" ]]; then
+        log_error "Daemon script not found: $DAEMON_SCRIPT"
+        exit 1
+    fi
+    "$DAEMON_SCRIPT" "$@"
 }
 
 main() {
@@ -850,6 +877,27 @@ main() {
             ;;
         --restore)
             restore_backup "${2:-}"
+            ;;
+        --watch-install)
+            run_daemon_cmd install
+            ;;
+        --watch-start)
+            run_daemon_cmd start
+            ;;
+        --watch-stop)
+            run_daemon_cmd stop
+            ;;
+        --watch-restart)
+            run_daemon_cmd restart
+            ;;
+        --watch-status)
+            run_daemon_cmd status
+            ;;
+        --watch-logs)
+            run_daemon_cmd follow
+            ;;
+        --watch-build)
+            run_daemon_cmd build
             ;;
         --help|-h|"")
             usage

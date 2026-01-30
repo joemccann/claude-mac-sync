@@ -460,3 +460,46 @@ claude-sync-conflicts() {
     echo "\033[1;33mDropbox Conflicted Files:\033[0m"
     echo "$conflicts"
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# File Watcher Daemon Functions
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Path to daemon control script (update this if installed elsewhere)
+CLAUDE_SYNC_DAEMON_SCRIPT="${CLAUDE_SYNC_DAEMON_SCRIPT:-$HOME/dev/apps/util/claude-mac-sync/claude-sync-daemon.sh}"
+
+# Main watcher control function
+claude-sync-watch() {
+    if [[ ! -f "$CLAUDE_SYNC_DAEMON_SCRIPT" ]]; then
+        echo "\033[0;31m[ERROR]\033[0m Daemon script not found: $CLAUDE_SYNC_DAEMON_SCRIPT"
+        echo "Set CLAUDE_SYNC_DAEMON_SCRIPT to the correct path."
+        return 1
+    fi
+
+    "$CLAUDE_SYNC_DAEMON_SCRIPT" "$@"
+}
+
+# Convenience aliases
+claude-watch-start() {
+    claude-sync-watch start
+}
+
+claude-watch-stop() {
+    claude-sync-watch stop
+}
+
+claude-watch-restart() {
+    claude-sync-watch restart
+}
+
+claude-watch-status() {
+    claude-sync-watch status
+}
+
+claude-watch-logs() {
+    claude-sync-watch follow
+}
+
+claude-watch-install() {
+    claude-sync-watch install
+}
