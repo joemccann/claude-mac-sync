@@ -15,7 +15,7 @@ mod watcher;
 use anyhow::Result;
 use clap::Parser;
 use config::Config;
-use sync::SyncEngine;
+use lock::ProcessLock;
 use watcher::SyncWatcher;
 
 /// Two-way file watching sync daemon for Claude Code configuration
@@ -132,12 +132,12 @@ fn validate_config(config: &Config) -> Result<()> {
         println!("  [WARN] Local config directory does not exist");
     }
 
-    // Check for lock
-    let sync_engine = SyncEngine::new(config.clone());
-    if sync_engine.is_locked() {
-        if let Some((machine, age)) = sync_engine.lock_info() {
+    // Check for local process lock
+    let process_lock = ProcessLock::new(config.local_lock_path());
+    if process_lock.is_locked_by_other() {
+        if let Some(pid) = process_lock.holder_pid() {
             println!();
-            println!("  [WARN] Sync is locked by {} ({} seconds ago)", machine, age);
+            println!("  [INFO] Daemon is running (PID {})", pid);
         }
     }
 
@@ -160,8 +160,8 @@ fn show_status(config: &Config) -> Result<()> {
     println!("Dropbox: {:?}", config.dropbox_claude_dir);
     println!();
 
-    // Load state
-    let state_path = config.dropbox_claude_dir.join(".sync_state.json");
+    // Load state (now stored locally, not in Dropbox)
+    let state_path = config.local_state_path();
     if state_path.exists() {
         match state::SyncState::load(&state_path) {
             Ok(state) => {
@@ -178,14 +178,14 @@ fn show_status(config: &Config) -> Result<()> {
 
     println!();
 
-    // Check lock
-    let sync_engine = SyncEngine::new(config.clone());
-    if sync_engine.is_locked() {
-        if let Some((machine, age)) = sync_engine.lock_info() {
-            println!("[LOCKED] by {} ({} seconds ago)", machine, age);
+    // Check local process lock
+    let process_lock = ProcessLock::new(config.local_lock_path());
+    if process_lock.is_locked_by_other() {
+        if let Some(pid) = process_lock.holder_pid() {
+            println!("[DAEMON RUNNING] PID {}", pid);
         }
     } else {
-        println!("[UNLOCKED] Ready to sync");
+        println!("[NO DAEMON] Ready to start");
     }
 
     println!();

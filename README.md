@@ -19,9 +19,11 @@ This solution provides two sync modes:
 ```
 Machine A                          Dropbox                         Machine B
 ~/.claude/  <->  claude-sync-watch  <->  ClaudeCodeSync/  <->  claude-sync-watch  <->  ~/.claude/
-                    (daemon)              .sync_state.json         (daemon)
-                                          .sync_lock
+  .sync_state.json   (daemon)              (files only)            (daemon)     .sync_state.json
+  .sync.pid                                                                     .sync.pid
 ```
+
+Note: State files are stored locally (not in Dropbox) to prevent conflict file explosion.
 
 **Manual sync architecture:**
 ```
@@ -382,11 +384,12 @@ LOG_LEVEL="info"          # debug, info, warn, error
 
 - **Debouncing**: Waits 3 seconds after the last change before syncing
 - **Batch mode**: Batches rapid changes (max 10 seconds)
-- **Distributed lock**: Prevents concurrent syncs across machines
+- **Local process lock**: Prevents multiple daemons on the same machine
 - **Backup first**: Creates a backup before every sync operation
 - **Smart backup cleanup**: Removes backups if no files actually changed
 - **File validation**: Rejects empty files and invalid JSON
 - **Checksum verification**: Verifies SHA-256 after every copy
+- **Timestamp-based conflict resolution**: Newer file wins when files differ
 
 ### Log Files
 
@@ -422,12 +425,22 @@ cat ~/.claude_sync_logs/sync-watch.err
 ./watch/target/release/claude-sync-watch --validate
 ```
 
-**"Sync locked by another machine"**
+**"Another sync daemon is already running"**
 
-The lock auto-expires after 60 seconds. If a machine crashed while holding the lock:
+This means another instance of the daemon is running on this machine:
 ```bash
-# Wait 60 seconds, or manually remove the lock
-rm ~/Dropbox/ClaudeCodeSync/.sync_lock
+# Check what's running
+./claude-sync-daemon.sh status
+
+# Stop the running daemon
+./claude-sync-daemon.sh stop
+```
+
+**Conflict files appearing in Dropbox**
+
+If you upgraded from an older version, clean up old conflict files:
+```bash
+./claude-sync-daemon.sh cleanup
 ```
 
 **Validation errors (empty files)**

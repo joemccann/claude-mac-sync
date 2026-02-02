@@ -1,7 +1,12 @@
 //! Sync engine - backup-first, copy, validate
+//!
+//! NOTE: Distributed locking was removed because it fundamentally cannot work
+//! with Dropbox's eventual consistency. Conflict resolution relies on:
+//! - mtime comparison (newer wins)
+//! - checksum verification
+//! - backup-first workflow
 
 use crate::config::Config;
-use crate::lock::SyncLock;
 use crate::state::{detect_changes, SyncState};
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -37,20 +42,17 @@ pub struct SyncResult {
 /// Sync engine
 pub struct SyncEngine {
     config: Config,
-    lock: SyncLock,
     state_path: PathBuf,
 }
 
 impl SyncEngine {
     /// Create a new sync engine
     pub fn new(config: Config) -> Self {
-        let machine_id = Config::machine_id();
-        let lock = SyncLock::new(&config.dropbox_claude_dir, machine_id);
-        let state_path = config.dropbox_claude_dir.join(".sync_state.json");
+        // State is stored locally (not in Dropbox) to prevent conflict file explosion
+        let state_path = config.local_state_path();
 
         Self {
             config,
-            lock,
             state_path,
         }
     }
@@ -59,22 +61,22 @@ impl SyncEngine {
     pub fn sync(&self, direction: SyncDirection) -> Result<SyncResult> {
         log::info!("Starting {:?} sync...", direction);
 
-        // 1. Acquire distributed lock
-        let _lock_guard = self.lock.acquire().context("Failed to acquire sync lock")?;
+        // NOTE: No distributed lock - it cannot work with Dropbox's eventual consistency.
+        // Conflict resolution is handled by mtime comparison and checksum verification.
 
-        // 2. CREATE BACKUP FIRST (mandatory!)
+        // 1. CREATE BACKUP FIRST (mandatory!)
         let backup_path = self.create_backup()?;
         log::info!("Backup created: {:?}", backup_path);
 
-        // 3. Ensure directories exist
+        // 2. Ensure directories exist
         fs::create_dir_all(&self.config.claude_dir)?;
         fs::create_dir_all(&self.config.dropbox_claude_dir)?;
 
-        // 4. Load sync state
+        // 3. Load sync state (from local storage, not Dropbox)
         let mut state = SyncState::load(&self.state_path).unwrap_or_default();
         state.machine_id = Config::machine_id();
 
-        // 5. Detect changes
+        // 4. Detect changes
         let changes = detect_changes(
             &self.config.claude_dir,
             &self.config.dropbox_claude_dir,
@@ -85,7 +87,7 @@ impl SyncEngine {
 
         log::info!("Detected {} change(s)", changes.len());
 
-        // 6. Apply changes based on direction
+        // 5. Apply changes based on direction
         let mut copied = 0;
         let mut skipped = 0;
         let mut warnings = Vec::new();
@@ -142,7 +144,7 @@ impl SyncEngine {
             }
         }
 
-        // 7. Save updated state
+        // 6. Save updated state (to local storage, not Dropbox)
         state.save(&self.state_path)?;
 
         log::info!(
@@ -249,16 +251,6 @@ impl SyncEngine {
             .with_context(|| format!("Invalid JSON in file: {:?}", path))?;
 
         Ok(())
-    }
-
-    /// Check if sync is currently locked by another machine
-    pub fn is_locked(&self) -> bool {
-        self.lock.is_locked_by_other()
-    }
-
-    /// Get lock info
-    pub fn lock_info(&self) -> Option<(String, i64)> {
-        self.lock.lock_info()
     }
 
     /// Validate source files before sync (pre-flight check)

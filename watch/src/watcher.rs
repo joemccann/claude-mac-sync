@@ -257,8 +257,8 @@ impl SyncWatcher {
             return true;
         }
 
-        // Ignore sync state and lock files
-        if file_name == ".sync_state.json" || file_name == ".sync_lock" {
+        // Ignore sync state and lock files (both old and new names)
+        if file_name == ".sync_state.json" || file_name == ".sync_lock" || file_name == ".sync.pid" {
             return true;
         }
 

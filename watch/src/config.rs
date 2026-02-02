@@ -143,6 +143,16 @@ impl Config {
             .map(|h| h.to_string_lossy().to_string())
             .unwrap_or_else(|_| "unknown".to_string())
     }
+
+    /// Get path for local state file (stored in ~/.claude, not Dropbox)
+    pub fn local_state_path(&self) -> PathBuf {
+        self.claude_dir.join(".sync_state.json")
+    }
+
+    /// Get path for local process lock file (stored in ~/.claude, not Dropbox)
+    pub fn local_lock_path(&self) -> PathBuf {
+        self.claude_dir.join(".sync.pid")
+    }
 }
 
 // Simple tilde expansion since we don't want to add another dependency

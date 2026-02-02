@@ -1,6 +1,6 @@
 [package]
 name = "claude-sync-watch"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Two-way file watching sync daemon for Claude Code configuration"
 authors = ["Joe McCann"]
@@ -17,6 +17,9 @@ log = "0.4"            # Logging facade
 env_logger = "0.11"    # Logger implementation
 clap = { version = "4", features = ["derive"] }  # CLI
 hostname = "0.4"       # Get machine ID
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"           # Unix process checking
 
 [profile.release]
 opt-level = 3

@@ -1,145 +1,114 @@
-//! Distributed lock via Dropbox for preventing concurrent syncs
+//! Local process lock to prevent multiple daemon instances on the same machine
+//!
+//! NOTE: This is NOT a distributed lock. Dropbox-based distributed locking was removed
+//! because it fundamentally cannot work with Dropbox's eventual consistency model.
+//! Dropbox sync creates race conditions that generate thousands of "conflicted copy" files.
+//!
+//! Conflict resolution between machines is handled by:
+//! - mtime comparison (newer wins)
+//! - checksum verification
+//! - backup-first workflow
 
 use anyhow::{bail, Context, Result};
-use chrono::Utc;
-use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-/// Lock timeout in seconds (auto-release stale locks)
-const LOCK_TIMEOUT_SECS: i64 = 60;
-
-/// Lock file content
-#[derive(Debug, Serialize, Deserialize)]
-struct LockFile {
-    machine_id: String,
-    timestamp: i64,
-    pid: u32,
-}
-
-/// Distributed sync lock
-pub struct SyncLock {
+/// Local process lock (prevents multiple daemons on same machine)
+pub struct ProcessLock {
     lock_path: PathBuf,
-    machine_id: String,
 }
 
-/// Guard that releases the lock when dropped
-pub struct LockGuard {
-    path: PathBuf,
-    machine_id: String,
-}
-
-impl SyncLock {
-    /// Create a new sync lock
-    pub fn new(dropbox_claude_dir: &Path, machine_id: String) -> Self {
-        Self {
-            lock_path: dropbox_claude_dir.join(".sync_lock"),
-            machine_id,
-        }
+impl ProcessLock {
+    /// Create a new process lock
+    pub fn new(lock_path: PathBuf) -> Self {
+        Self { lock_path }
     }
 
-    /// Attempt to acquire the lock
-    pub fn acquire(&self) -> Result<LockGuard> {
+    /// Attempt to acquire the process lock
+    ///
+    /// Returns Ok(()) if lock acquired, Err if another process holds it
+    #[allow(dead_code)]
+    pub fn acquire(&self) -> Result<()> {
         // Ensure parent directory exists
         if let Some(parent) = self.lock_path.parent() {
             fs::create_dir_all(parent)?;
         }
 
         // Check for existing lock
-        if let Ok(content) = fs::read_to_string(&self.lock_path) {
-            if let Ok(lock) = serde_json::from_str::<LockFile>(&content) {
-                let age = Utc::now().timestamp() - lock.timestamp;
-
-                if age < LOCK_TIMEOUT_SECS && lock.machine_id != self.machine_id {
-                    bail!(
-                        "Sync locked by {} ({} seconds ago). Will auto-release after {} seconds.",
-                        lock.machine_id,
-                        age,
-                        LOCK_TIMEOUT_SECS - age
-                    );
+        if self.lock_path.exists() {
+            if let Ok(content) = fs::read_to_string(&self.lock_path) {
+                if let Ok(pid) = content.trim().parse::<u32>() {
+                    // Check if the process is still running
+                    if process_exists(pid) {
+                        bail!(
+                            "Another sync daemon is already running (PID {}). \
+                             Stop it first with: ./claude-sync-daemon.sh stop",
+                            pid
+                        );
+                    }
+                    // Process is dead, stale lock file
+                    log::debug!("Removing stale lock file from dead process {}", pid);
                 }
-                // Lock is stale or ours - we can take it
-                log::debug!(
-                    "Taking over lock from {} (age: {}s)",
-                    lock.machine_id,
-                    age
-                );
             }
         }
 
-        // Write our lock
-        let lock = LockFile {
-            machine_id: self.machine_id.clone(),
-            timestamp: Utc::now().timestamp(),
-            pid: std::process::id(),
-        };
-
-        let content = serde_json::to_string_pretty(&lock)?;
-        fs::write(&self.lock_path, &content)
+        // Write our PID to the lock file
+        let pid = std::process::id();
+        fs::write(&self.lock_path, pid.to_string())
             .with_context(|| format!("Failed to write lock file: {:?}", self.lock_path))?;
 
-        log::debug!("Acquired sync lock");
-
-        Ok(LockGuard {
-            path: self.lock_path.clone(),
-            machine_id: self.machine_id.clone(),
-        })
+        log::debug!("Acquired process lock (PID {})", pid);
+        Ok(())
     }
 
-    /// Check if the lock is currently held by another machine
-    pub fn is_locked_by_other(&self) -> bool {
+    /// Release the lock (only if we own it)
+    pub fn release(&self) {
         if let Ok(content) = fs::read_to_string(&self.lock_path) {
-            if let Ok(lock) = serde_json::from_str::<LockFile>(&content) {
-                let age = Utc::now().timestamp() - lock.timestamp;
-                return age < LOCK_TIMEOUT_SECS && lock.machine_id != self.machine_id;
-            }
-        }
-        false
-    }
-
-    /// Get info about who holds the lock
-    pub fn lock_info(&self) -> Option<(String, i64)> {
-        fs::read_to_string(&self.lock_path).ok().and_then(|content| {
-            serde_json::from_str::<LockFile>(&content)
-                .ok()
-                .map(|lock| {
-                    let age = Utc::now().timestamp() - lock.timestamp;
-                    (lock.machine_id, age)
-                })
-        })
-    }
-}
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        // Only remove the lock if it's still ours
-        if let Ok(content) = fs::read_to_string(&self.path) {
-            if let Ok(lock) = serde_json::from_str::<LockFile>(&content) {
-                if lock.machine_id == self.machine_id {
-                    if let Err(e) = fs::remove_file(&self.path) {
-                        log::warn!("Failed to release lock: {}", e);
+            if let Ok(pid) = content.trim().parse::<u32>() {
+                if pid == std::process::id() {
+                    if let Err(e) = fs::remove_file(&self.lock_path) {
+                        log::warn!("Failed to release process lock: {}", e);
                     } else {
-                        log::debug!("Released sync lock");
+                        log::debug!("Released process lock");
                     }
                 }
             }
         }
     }
+
+    /// Check if another process holds the lock
+    pub fn is_locked_by_other(&self) -> bool {
+        if let Ok(content) = fs::read_to_string(&self.lock_path) {
+            if let Ok(pid) = content.trim().parse::<u32>() {
+                return pid != std::process::id() && process_exists(pid);
+            }
+        }
+        false
+    }
+
+    /// Get the PID of the process holding the lock, if any
+    pub fn holder_pid(&self) -> Option<u32> {
+        fs::read_to_string(&self.lock_path).ok().and_then(|content| {
+            content.trim().parse::<u32>().ok().filter(|&pid| process_exists(pid))
+        })
+    }
 }
 
-impl LockGuard {
-    /// Refresh the lock timestamp (for long operations)
-    #[allow(dead_code)]
-    pub fn refresh(&self) -> Result<()> {
-        let lock = LockFile {
-            machine_id: self.machine_id.clone(),
-            timestamp: Utc::now().timestamp(),
-            pid: std::process::id(),
-        };
-
-        let content = serde_json::to_string_pretty(&lock)?;
-        fs::write(&self.path, &content)?;
-        log::debug!("Refreshed lock timestamp");
-        Ok(())
+impl Drop for ProcessLock {
+    fn drop(&mut self) {
+        self.release();
     }
+}
+
+/// Check if a process with the given PID exists
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    // On Unix, sending signal 0 checks if process exists without affecting it
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn process_exists(_pid: u32) -> bool {
+    // Conservative fallback: assume process exists
+    true
 }

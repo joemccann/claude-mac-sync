@@ -272,6 +272,75 @@ cmd_validate() {
     "$BINARY" --validate
 }
 
+cmd_cleanup() {
+    # Load config to get Dropbox path
+    local config_file="$HOME/.claude_sync_config"
+    local dropbox_base=""
+
+    if [[ -f "$config_file" ]]; then
+        dropbox_base=$(grep "^DROPBOX_BASE=" "$config_file" | cut -d'=' -f2 | tr -d '"' | sed "s|^~|$HOME|")
+    fi
+
+    # Try to detect if not configured
+    if [[ -z "$dropbox_base" ]]; then
+        for candidate in "$HOME/Dropbox" "$HOME/Dropbox (Personal)" "$HOME/Library/CloudStorage/Dropbox"; do
+            if [[ -d "$candidate" ]]; then
+                dropbox_base="$candidate"
+                break
+            fi
+        done
+    fi
+
+    if [[ -z "$dropbox_base" ]] || [[ ! -d "$dropbox_base" ]]; then
+        log_error "Could not find Dropbox directory"
+        exit 1
+    fi
+
+    local sync_dir="$dropbox_base/ClaudeCodeSync"
+
+    if [[ ! -d "$sync_dir" ]]; then
+        log_error "Sync directory does not exist: $sync_dir"
+        exit 1
+    fi
+
+    # Count conflict files
+    local conflict_count
+    conflict_count=$(find "$sync_dir" -name "*conflicted*" 2>/dev/null | wc -l | tr -d ' ')
+
+    if [[ "$conflict_count" -eq 0 ]]; then
+        log_success "No conflict files found"
+        return 0
+    fi
+
+    log_warn "Found $conflict_count conflict file(s) in $sync_dir"
+    echo ""
+
+    # Show first few
+    log_info "First 10 conflict files:"
+    find "$sync_dir" -name "*conflicted*" 2>/dev/null | head -10
+    echo ""
+
+    # Ask for confirmation
+    read -p "Delete all $conflict_count conflict files? (y/N) " -n 1 -r
+    echo ""
+
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        log_info "Deleting conflict files..."
+        find "$sync_dir" -name "*conflicted*" -delete 2>/dev/null
+        log_success "Deleted $conflict_count conflict file(s)"
+
+        # Also remove old state/lock from Dropbox if present
+        for f in "$sync_dir/.sync_state.json" "$sync_dir/.sync_lock"; do
+            if [[ -f "$f" ]]; then
+                rm -f "$f"
+                log_info "Removed old file: $f"
+            fi
+        done
+    else
+        log_info "Cleanup cancelled"
+    fi
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -292,12 +361,14 @@ Commands:
   follow      Follow log file in real-time
   once        Run one-time sync (no watch)
   validate    Validate configuration
+  cleanup     Delete Dropbox conflict files and old state files
 
 Examples:
   $0 install     # First-time setup
   $0 status      # Check if running
   $0 follow      # Watch logs live
   $0 once        # Manual sync
+  $0 cleanup     # Clean up conflict files
 EOF
 }
 
@@ -314,6 +385,7 @@ main() {
         follow)    cmd_logs_follow ;;
         once)      cmd_once ;;
         validate)  cmd_validate ;;
+        cleanup)   cmd_cleanup ;;
         --help|-h|help|"")
             usage
             exit 0
