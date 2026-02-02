@@ -34,9 +34,10 @@ claude-mac-sync/
 All sync operations follow these safety principles:
 
 1. **Backup first**: Always create a timestamped backup before any sync
-2. **Validate before copy**: Reject empty files (Dropbox sync incomplete) and invalid JSON
-3. **Checksum verification**: SHA-256 verify every file after copying
-4. **Distributed lock**: Prevent concurrent syncs across machines (60s timeout)
+2. **Smart backup cleanup**: Backups are automatically removed if no files changed during sync
+3. **Validate before copy**: Reject empty files (Dropbox sync incomplete) and invalid JSON
+4. **Checksum verification**: SHA-256 verify every file after copying
+5. **Distributed lock**: Prevent concurrent syncs across machines (60s timeout)
 
 ### Files Synced
 

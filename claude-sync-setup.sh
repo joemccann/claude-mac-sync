@@ -131,6 +131,84 @@ validate_dir_copy() {
     return 0
 }
 
+# Check if two directories have identical content (for backup comparison)
+dirs_are_identical() {
+    local dir1="$1"
+    local dir2="$2"
+
+    # Both must exist
+    if [[ ! -d "$dir1" || ! -d "$dir2" ]]; then
+        return 1
+    fi
+
+    # Compare file counts first (quick check)
+    local count1 count2
+    count1=$(find "$dir1" -type f | wc -l | tr -d ' ')
+    count2=$(find "$dir2" -type f | wc -l | tr -d ' ')
+
+    if [[ "$count1" != "$count2" ]]; then
+        return 1
+    fi
+
+    # Compare each file's checksum
+    while IFS= read -r -d '' file; do
+        local rel_path="${file#$dir1/}"
+        local other_file="$dir2/$rel_path"
+
+        if [[ ! -f "$other_file" ]]; then
+            return 1
+        fi
+
+        local sum1 sum2
+        sum1=$(shasum -a 256 "$file" 2>/dev/null | cut -d' ' -f1)
+        sum2=$(shasum -a 256 "$other_file" 2>/dev/null | cut -d' ' -f1)
+
+        if [[ "$sum1" != "$sum2" ]]; then
+            return 1
+        fi
+    done < <(find "$dir1" -type f -print0)
+
+    return 0
+}
+
+# Remove a backup if it's identical to the current state (no changes occurred)
+cleanup_backup_if_unchanged() {
+    local backup_path="$1"
+
+    if [[ -z "$backup_path" || ! -d "$backup_path" ]]; then
+        return 0
+    fi
+
+    if dirs_are_identical "$backup_path" "$CLAUDE_DIR"; then
+        log_info "No changes detected, removing unnecessary backup: $backup_path"
+        rm -rf "$backup_path"
+
+        # Update symlink to point to previous backup if exists
+        if [[ -L "$BACKUP_DIR" ]]; then
+            rm -f "$BACKUP_DIR"
+            # Find most recent remaining backup
+            local latest_backup
+            latest_backup=$(ls -dt "$HOME"/.claude_backup.* 2>/dev/null | head -1)
+            if [[ -n "$latest_backup" && -d "$latest_backup" ]]; then
+                ln -s "$latest_backup" "$BACKUP_DIR"
+            fi
+        fi
+
+        # Clear last backup marker if it pointed to this backup
+        if [[ -f "$HOME/.claude_sync_last_backup" ]]; then
+            local stored_backup
+            stored_backup=$(cat "$HOME/.claude_sync_last_backup")
+            if [[ "$stored_backup" == "$backup_path" ]]; then
+                rm -f "$HOME/.claude_sync_last_backup"
+            fi
+        fi
+
+        return 0  # Backup was removed (no changes)
+    fi
+
+    return 1  # Backup was kept (changes occurred)
+}
+
 # Copy file with integrity validation
 safe_copy_file() {
     local src="$1"
@@ -311,6 +389,9 @@ ensure_config() {
 # Backup
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Creates backup and stores path in LAST_CREATED_BACKUP variable for later cleanup
+LAST_CREATED_BACKUP=""
+
 create_backup() {
     local timestamp
     timestamp=$(date +%Y%m%d_%H%M%S)
@@ -320,11 +401,15 @@ create_backup() {
 
     if [[ ! -d "$CLAUDE_DIR" ]]; then
         log_warn "~/.claude does not exist. Nothing to backup."
+        LAST_CREATED_BACKUP=""
         return 0
     fi
 
     cp -a "$CLAUDE_DIR" "$backup_path"
     log_success "Backup created: $backup_path"
+
+    # Store for potential cleanup later
+    LAST_CREATED_BACKUP="$backup_path"
 
     # Save the backup path for undo capability
     echo "$backup_path" > "$HOME/.claude_sync_last_backup"
@@ -429,6 +514,11 @@ push_to_dropbox() {
     else
         log_success "Push complete. Copied: $copied, Skipped: $skipped (all verified)"
         log_info "Files are now in: $DROPBOX_CLAUDE_DIR"
+
+        # Cleanup backup if no changes were made
+        if [[ -n "$LAST_CREATED_BACKUP" ]]; then
+            cleanup_backup_if_unchanged "$LAST_CREATED_BACKUP"
+        fi
     fi
 }
 
@@ -571,6 +661,11 @@ pull_from_dropbox() {
         return 1
     else
         log_success "Pull complete. Copied: $copied, Skipped: $skipped (all verified)"
+
+        # Cleanup backup if no changes were made
+        if [[ -n "$LAST_CREATED_BACKUP" ]]; then
+            cleanup_backup_if_unchanged "$LAST_CREATED_BACKUP"
+        fi
     fi
 }
 
@@ -691,6 +786,68 @@ restore_backup() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Cleanup Backups: Remove redundant backups keeping only unique ones
+# ─────────────────────────────────────────────────────────────────────────────
+
+cleanup_backups() {
+    echo ""
+    log_info "Analyzing backups for redundant copies..."
+
+    # Collect all backups sorted by timestamp (oldest first)
+    local backups=()
+    while IFS= read -r backup; do
+        [[ -d "$backup" ]] && backups+=("$backup")
+    done < <(ls -dt "$HOME"/.claude_backup.* 2>/dev/null | tac)
+
+    local total=${#backups[@]}
+    if [[ $total -eq 0 ]]; then
+        log_info "No backups found."
+        return 0
+    fi
+
+    log_info "Found $total backup(s). Comparing contents..."
+
+    local removed=0
+    local kept=0
+    local prev_backup=""
+
+    for backup in "${backups[@]}"; do
+        if [[ -z "$prev_backup" ]]; then
+            # Keep the first (oldest) backup
+            log_success "Keeping: $backup (oldest)"
+            prev_backup="$backup"
+            ((kept++))
+            continue
+        fi
+
+        # Compare with previous backup
+        if dirs_are_identical "$backup" "$prev_backup"; then
+            log_info "Removing redundant: $backup"
+            rm -rf "$backup"
+            ((removed++))
+        else
+            log_success "Keeping: $backup (has changes)"
+            prev_backup="$backup"
+            ((kept++))
+        fi
+    done
+
+    echo ""
+    log_success "Cleanup complete. Removed: $removed, Kept: $kept"
+
+    # Update symlink to point to most recent remaining backup
+    local latest_backup
+    latest_backup=$(ls -dt "$HOME"/.claude_backup.* 2>/dev/null | head -1)
+    if [[ -n "$latest_backup" && -d "$latest_backup" ]]; then
+        if [[ -L "$BACKUP_DIR" ]]; then
+            rm -f "$BACKUP_DIR"
+        fi
+        ln -s "$latest_backup" "$BACKUP_DIR"
+        log_info "Latest backup link updated: $BACKUP_DIR -> $latest_backup"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Status: Show sync status and differences
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -799,6 +956,7 @@ Options:
   --undo           Restore previous state after a pull
   --backups        List all available backups
   --restore <path> Restore from a specific backup
+  --cleanup-backups Remove redundant backups (keeps only unique ones)
 
 Watch Daemon (automatic two-way sync):
   --watch-install  Build and install the watch daemon
@@ -877,6 +1035,13 @@ main() {
             ;;
         --restore)
             restore_backup "${2:-}"
+            ;;
+        --cleanup-backups)
+            if confirm "This will remove redundant backups. Continue?"; then
+                cleanup_backups
+            else
+                log_info "Aborted."
+            fi
             ;;
         --watch-install)
             run_daemon_cmd install

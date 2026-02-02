@@ -101,6 +101,7 @@ chmod +x claude-sync-setup.sh
 | `--undo` | Restore previous state after a pull |
 | `--backups` | List all available backups |
 | `--restore <path>` | Restore from a specific backup |
+| `--cleanup-backups` | Remove redundant backups (keeps only unique ones) |
 
 ### Watch Daemon Commands
 
@@ -250,11 +251,13 @@ rm ~/Dropbox/ClaudeCodeSync/"settings (*conflicted*).json"
 
 ## Backups
 
-Every `--push` and `--pull` operation automatically creates a timestamped backup:
+Every `--push` and `--pull` operation creates a timestamped backup before making changes:
 
 ```
 ~/.claude_backup.20250128_143022/
 ```
+
+**Smart Backup Cleanup**: Backups are automatically deleted after sync if no files actually changed. This prevents accumulation of identical backup folders while preserving the safety guarantee during the sync operation.
 
 Manual backup:
 ```bash
@@ -274,6 +277,13 @@ claude-sync-undo
 
 # Restore from a specific backup
 ./claude-sync-setup.sh --restore ~/.claude_backup.20250128_143022
+```
+
+Clean up redundant backups:
+```bash
+# Remove backup folders that have identical content to the next backup
+# (useful for one-time cleanup of accumulated backups)
+./claude-sync-setup.sh --cleanup-backups
 ```
 
 ---
@@ -374,6 +384,7 @@ LOG_LEVEL="info"          # debug, info, warn, error
 - **Batch mode**: Batches rapid changes (max 10 seconds)
 - **Distributed lock**: Prevents concurrent syncs across machines
 - **Backup first**: Creates a backup before every sync operation
+- **Smart backup cleanup**: Removes backups if no files actually changed
 - **File validation**: Rejects empty files and invalid JSON
 - **Checksum verification**: Verifies SHA-256 after every copy
 

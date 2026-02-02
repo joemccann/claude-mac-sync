@@ -1,6 +1,6 @@
 [package]
 name = "claude-sync-watch"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Two-way file watching sync daemon for Claude Code configuration"
 authors = ["Joe McCann"]
