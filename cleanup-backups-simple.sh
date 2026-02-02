@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Simple backup cleanup - keeps most recent N backups, removes the rest
+# Also cleans up Dropbox conflict files
 
 set -euo pipefail
 
@@ -35,14 +36,13 @@ log_info "Found $total backups"
 
 if [[ $total -le $MAX_KEEP ]]; then
     log_success "Only $total backups exist (≤ $MAX_KEEP). Nothing to remove."
-    exit 0
-fi
+    # Don't exit - continue to Dropbox conflict cleanup
+else
+    to_remove=$((total - MAX_KEEP))
+    log_info "Will remove: $to_remove oldest backups"
 
-to_remove=$((total - MAX_KEEP))
-log_info "Will remove: $to_remove oldest backups"
-
-echo ""
-if [[ "$DRY_RUN" == "true" ]]; then
+    echo ""
+    if [[ "$DRY_RUN" == "true" ]]; then
     log_warn "Would keep these $MAX_KEEP most recent backup(s):"
     ls -dt "$HOME"/.claude_backup.* 2>/dev/null | head -$MAX_KEEP | while read -r b; do
         timestamp=$(basename "$b" | sed 's/.claude_backup.//')
@@ -85,6 +85,31 @@ else
         echo "  ✓ $timestamp"
     done
     [[ $remaining -gt 5 ]] && echo "  ... and $((remaining - 5)) more"
+    fi
+fi
+
+# Cleanup Dropbox conflict files
+echo ""
+log_info "Checking for Dropbox conflict files..."
+
+conflict_count=$(find ~/Dropbox*/ClaudeCodeSync -name "*conflicted copy*" -type f 2>/dev/null | wc -l | tr -d ' ')
+
+if [[ $conflict_count -eq 0 ]]; then
+    log_success "No Dropbox conflict files found."
+else
+    log_info "Found $conflict_count Dropbox conflict file(s)"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_warn "Would remove $conflict_count conflict file(s)"
+        find ~/Dropbox*/ClaudeCodeSync -name "*conflicted copy*" -type f 2>/dev/null | head -10 | while read -r f; do
+            echo "  ✗ $(basename "$f")"
+        done
+        [[ $conflict_count -gt 10 ]] && echo "  ... and $((conflict_count - 10)) more"
+    else
+        log_info "Removing $conflict_count conflict file(s)..."
+        find ~/Dropbox*/ClaudeCodeSync -name "*conflicted copy*" -type f -delete 2>/dev/null
+        log_success "Removed $conflict_count Dropbox conflict files"
+    fi
 fi
 
 echo ""
