@@ -171,7 +171,85 @@ dirs_are_identical() {
     return 0
 }
 
-# Remove a backup if it's identical to the current state (no changes occurred)
+# Compare only synced files between two directories
+# Ignores debug/, file-history/, todos/, etc.
+synced_files_are_identical() {
+    local dir1="$1"
+    local dir2="$2"
+
+    # Both must exist
+    if [[ ! -d "$dir1" || ! -d "$dir2" ]]; then
+        return 1
+    fi
+
+    # Compare individual sync files
+    for file in "${SYNC_FILES[@]}"; do
+        local file1="$dir1/$file"
+        local file2="$dir2/$file"
+
+        # If file exists in one but not the other, they differ
+        if [[ -f "$file1" && ! -f "$file2" ]] || [[ ! -f "$file1" && -f "$file2" ]]; then
+            return 1
+        fi
+
+        # If both exist, compare checksums
+        if [[ -f "$file1" ]]; then
+            local sum1 sum2
+            sum1=$(shasum -a 256 "$file1" 2>/dev/null | cut -d' ' -f1)
+            sum2=$(shasum -a 256 "$file2" 2>/dev/null | cut -d' ' -f1)
+
+            if [[ "$sum1" != "$sum2" ]]; then
+                return 1
+            fi
+        fi
+    done
+
+    # Compare sync directories
+    for dir in "${SYNC_DIRS[@]}"; do
+        local dir1_path="$dir1/$dir"
+        local dir2_path="$dir2/$dir"
+
+        # If directory exists in one but not the other, they differ
+        if [[ -d "$dir1_path" && ! -d "$dir2_path" ]] || [[ ! -d "$dir1_path" && -d "$dir2_path" ]]; then
+            return 1
+        fi
+
+        # If both exist, compare all files within
+        if [[ -d "$dir1_path" ]]; then
+            # Check file counts
+            local count1 count2
+            count1=$(find "$dir1_path" -type f | wc -l | tr -d ' ')
+            count2=$(find "$dir2_path" -type f | wc -l | tr -d ' ')
+
+            if [[ "$count1" != "$count2" ]]; then
+                return 1
+            fi
+
+            # Compare each file
+            while IFS= read -r -d '' file; do
+                local rel_path="${file#$dir1_path/}"
+                local other_file="$dir2_path/$rel_path"
+
+                if [[ ! -f "$other_file" ]]; then
+                    return 1
+                fi
+
+                local sum1 sum2
+                sum1=$(shasum -a 256 "$file" 2>/dev/null | cut -d' ' -f1)
+                sum2=$(shasum -a 256 "$other_file" 2>/dev/null | cut -d' ' -f1)
+
+                if [[ "$sum1" != "$sum2" ]]; then
+                    return 1
+                fi
+            done < <(find "$dir1_path" -type f -print0)
+        fi
+    done
+
+    return 0
+}
+
+# Remove a backup if synced files are identical (no synced changes occurred)
+# Only compares synced files, ignoring debug/, file-history/, todos/, etc.
 cleanup_backup_if_unchanged() {
     local backup_path="$1"
 
@@ -179,8 +257,8 @@ cleanup_backup_if_unchanged() {
         return 0
     fi
 
-    if dirs_are_identical "$backup_path" "$CLAUDE_DIR"; then
-        log_info "No changes detected, removing unnecessary backup: $backup_path"
+    if synced_files_are_identical "$backup_path" "$CLAUDE_DIR"; then
+        log_info "No synced files changed, removing unnecessary backup: $backup_path"
         rm -rf "$backup_path"
 
         # Update symlink to point to previous backup if exists
@@ -790,14 +868,18 @@ restore_backup() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 cleanup_backups() {
+    local max_unique_backups="${1:-10}"  # Keep at most 10 unique backups by default
+    local dry_run="${2:-false}"
+
     echo ""
-    log_info "Analyzing backups for redundant copies..."
+    log_info "Analyzing backups for redundant copies (comparing synced files only)..."
+    log_info "Retention limit: $max_unique_backups unique backups"
 
     # Collect all backups sorted by timestamp (oldest first)
     local backups=()
     while IFS= read -r backup; do
         [[ -d "$backup" ]] && backups+=("$backup")
-    done < <(ls -dt "$HOME"/.claude_backup.* 2>/dev/null | tac)
+    done < <(ls -dt "$HOME"/.claude_backup.* 2>/dev/null | tail -r)
 
     local total=${#backups[@]}
     if [[ $total -eq 0 ]]; then
@@ -805,45 +887,75 @@ cleanup_backups() {
         return 0
     fi
 
-    log_info "Found $total backup(s). Comparing contents..."
+    log_info "Found $total backup(s). Comparing synced files only..."
 
     local removed=0
     local kept=0
+    local unique_kept=0
     local prev_backup=""
+    local unique_backups=()
 
     for backup in "${backups[@]}"; do
         if [[ -z "$prev_backup" ]]; then
             # Keep the first (oldest) backup
             log_success "Keeping: $backup (oldest)"
             prev_backup="$backup"
+            unique_backups+=("$backup")
             ((kept++))
+            ((unique_kept++))
             continue
         fi
 
-        # Compare with previous backup
-        if dirs_are_identical "$backup" "$prev_backup"; then
-            log_info "Removing redundant: $backup"
-            rm -rf "$backup"
+        # Compare synced files only with previous unique backup
+        if synced_files_are_identical "$backup" "$prev_backup"; then
+            log_info "Removing redundant: $backup (synced files identical)"
+            if [[ "$dry_run" != "true" ]]; then
+                rm -rf "$backup"
+            fi
             ((removed++))
         else
-            log_success "Keeping: $backup (has changes)"
+            log_success "Keeping: $backup (synced files changed)"
             prev_backup="$backup"
+            unique_backups+=("$backup")
             ((kept++))
+            ((unique_kept++))
         fi
     done
 
+    # Apply retention limit: keep only the most recent N unique backups
+    local excess=$((unique_kept - max_unique_backups))
+    if [[ $excess -gt 0 ]]; then
+        echo ""
+        log_info "Applying retention limit: removing $excess oldest unique backup(s)..."
+        for ((i=0; i<excess; i++)); do
+            local old_backup="${unique_backups[$i]}"
+            log_info "Removing old backup: $old_backup"
+            if [[ "$dry_run" != "true" ]]; then
+                rm -rf "$old_backup"
+            fi
+            ((removed++))
+            ((kept--))
+        done
+    fi
+
     echo ""
-    log_success "Cleanup complete. Removed: $removed, Kept: $kept"
+    if [[ "$dry_run" == "true" ]]; then
+        log_success "Dry run complete. Would remove: $removed, Would keep: $kept"
+    else
+        log_success "Cleanup complete. Removed: $removed, Kept: $kept"
+    fi
 
     # Update symlink to point to most recent remaining backup
-    local latest_backup
-    latest_backup=$(ls -dt "$HOME"/.claude_backup.* 2>/dev/null | head -1)
-    if [[ -n "$latest_backup" && -d "$latest_backup" ]]; then
-        if [[ -L "$BACKUP_DIR" ]]; then
-            rm -f "$BACKUP_DIR"
+    if [[ "$dry_run" != "true" ]]; then
+        local latest_backup
+        latest_backup=$(ls -dt "$HOME"/.claude_backup.* 2>/dev/null | head -1)
+        if [[ -n "$latest_backup" && -d "$latest_backup" ]]; then
+            if [[ -L "$BACKUP_DIR" ]]; then
+                rm -f "$BACKUP_DIR"
+            fi
+            ln -s "$latest_backup" "$BACKUP_DIR"
+            log_info "Latest backup link updated: $BACKUP_DIR -> $latest_backup"
         fi
-        ln -s "$latest_backup" "$BACKUP_DIR"
-        log_info "Latest backup link updated: $BACKUP_DIR -> $latest_backup"
     fi
 }
 
@@ -956,7 +1068,10 @@ Options:
   --undo           Restore previous state after a pull
   --backups        List all available backups
   --restore <path> Restore from a specific backup
-  --cleanup-backups Remove redundant backups (keeps only unique ones)
+  --cleanup-backups [N] [--dry-run]
+                    Remove redundant backups (keeps only unique synced files)
+                    N: max unique backups to keep (default: 10)
+                    --dry-run: preview what would be deleted without removing
 
 Watch Daemon (automatic two-way sync):
   --watch-install  Build and install the watch daemon
@@ -1037,10 +1152,36 @@ main() {
             restore_backup "${2:-}"
             ;;
         --cleanup-backups)
-            if confirm "This will remove redundant backups. Continue?"; then
-                cleanup_backups
+            shift
+            local max_backups=10
+            local dry_run=false
+
+            # Parse optional arguments
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --dry-run)
+                        dry_run=true
+                        shift
+                        ;;
+                    [0-9]*)
+                        max_backups="$1"
+                        shift
+                        ;;
+                    *)
+                        break
+                        ;;
+                esac
+            done
+
+            if [[ "$dry_run" == "true" ]]; then
+                log_info "Running in dry-run mode (no files will be deleted)..."
+                cleanup_backups "$max_backups" "true"
             else
-                log_info "Aborted."
+                if confirm "This will remove redundant backups (keeping max $max_backups unique). Continue?"; then
+                    cleanup_backups "$max_backups" "false"
+                else
+                    log_info "Aborted."
+                fi
             fi
             ;;
         --watch-install)

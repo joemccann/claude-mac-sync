@@ -153,8 +153,13 @@ impl SyncEngine {
             skipped
         );
 
-        // Cleanup backup if no changes were made
-        let final_backup_path = if cleanup_backup_if_unchanged(&backup_path, &self.config.claude_dir) {
+        // Cleanup backup if no synced files changed
+        let final_backup_path = if cleanup_backup_if_unchanged(
+            &backup_path,
+            &self.config.claude_dir,
+            &self.config.sync_files,
+            &self.config.sync_dirs,
+        ) {
             None // Backup was removed
         } else {
             Some(backup_path) // Backup was kept
@@ -169,6 +174,7 @@ impl SyncEngine {
     }
 
     /// Create a timestamped backup of ~/.claude
+    /// Skips creating backup if synced files haven't changed since last backup
     fn create_backup(&self) -> Result<PathBuf> {
         let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
         let backup_path = PathBuf::from(format!(
@@ -184,13 +190,37 @@ impl SyncEngine {
             return Ok(backup_path);
         }
 
-        // Use cp -a to preserve metadata
-        copy_dir_all(&self.config.claude_dir, &backup_path)?;
-
-        // Save path for undo capability
+        // Check if synced files have changed since last backup
         let last_backup_file = dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join(".claude_sync_last_backup");
+
+        if last_backup_file.exists() {
+            if let Ok(last_backup_path_str) = fs::read_to_string(&last_backup_file) {
+                let last_backup_path = PathBuf::from(last_backup_path_str.trim());
+                if last_backup_path.exists() {
+                    // Compare only synced files
+                    if synced_files_are_identical(
+                        &self.config.claude_dir,
+                        &last_backup_path,
+                        &self.config.sync_files,
+                        &self.config.sync_dirs,
+                    ) {
+                        log::info!(
+                            "Synced files unchanged since last backup, skipping new backup"
+                        );
+                        // Return the existing backup path for reference
+                        return Ok(last_backup_path);
+                    }
+                }
+            }
+        }
+
+        // Create new backup - synced files have changed
+        log::info!("Creating backup: {:?}", backup_path);
+        copy_dir_all(&self.config.claude_dir, &backup_path)?;
+
+        // Save path for undo capability
         fs::write(&last_backup_file, backup_path.to_string_lossy().as_bytes())?;
 
         Ok(backup_path)
@@ -441,15 +471,112 @@ fn dirs_are_identical(dir1: &Path, dir2: &Path) -> bool {
     true
 }
 
+/// Check if only the synced files are identical between two directories
+/// This ignores non-synced files like debug/, file-history/, todos/, etc.
+fn synced_files_are_identical(
+    dir1: &Path,
+    dir2: &Path,
+    sync_files: &[String],
+    sync_dirs: &[String],
+) -> bool {
+    if !dir1.exists() || !dir2.exists() {
+        return false;
+    }
+
+    // Compare individual sync files
+    for file in sync_files {
+        let file1 = dir1.join(file);
+        let file2 = dir2.join(file);
+
+        // If file exists in one but not the other, they differ
+        if file1.exists() != file2.exists() {
+            return false;
+        }
+
+        // If both exist, compare checksums
+        if file1.exists() {
+            let hash1 = match sha256_file(&file1) {
+                Ok(h) => h,
+                Err(_) => return false,
+            };
+            let hash2 = match sha256_file(&file2) {
+                Ok(h) => h,
+                Err(_) => return false,
+            };
+
+            if hash1 != hash2 {
+                return false;
+            }
+        }
+    }
+
+    // Compare sync directories
+    for dir in sync_dirs {
+        let dir1_path = dir1.join(dir);
+        let dir2_path = dir2.join(dir);
+
+        // If directory exists in one but not the other, they differ
+        if dir1_path.exists() != dir2_path.exists() {
+            return false;
+        }
+
+        // If both exist, walk and compare all files within
+        if dir1_path.exists() {
+            let files1 = walkdir(&dir1_path);
+            let files2 = walkdir(&dir2_path);
+
+            // Check file counts
+            if files1.len() != files2.len() {
+                return false;
+            }
+
+            // Compare each file
+            for file1 in &files1 {
+                let rel_path = match file1.strip_prefix(&dir1_path) {
+                    Ok(p) => p,
+                    Err(_) => return false,
+                };
+                let file2 = dir2_path.join(rel_path);
+
+                if !file2.exists() {
+                    return false;
+                }
+
+                // Compare checksums
+                let hash1 = match sha256_file(file1) {
+                    Ok(h) => h,
+                    Err(_) => return false,
+                };
+                let hash2 = match sha256_file(&file2) {
+                    Ok(h) => h,
+                    Err(_) => return false,
+                };
+
+                if hash1 != hash2 {
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
+}
+
 /// Remove backup if identical to current state (no changes occurred)
-fn cleanup_backup_if_unchanged(backup_path: &Path, claude_dir: &Path) -> bool {
+/// Only compares synced files, ignoring debug/, file-history/, todos/, etc.
+fn cleanup_backup_if_unchanged(
+    backup_path: &Path,
+    claude_dir: &Path,
+    sync_files: &[String],
+    sync_dirs: &[String],
+) -> bool {
     if !backup_path.exists() {
         return false;
     }
 
-    if dirs_are_identical(backup_path, claude_dir) {
+    if synced_files_are_identical(backup_path, claude_dir, sync_files, sync_dirs) {
         log::info!(
-            "No changes detected, removing unnecessary backup: {:?}",
+            "No synced files changed, removing unnecessary backup: {:?}",
             backup_path
         );
 
