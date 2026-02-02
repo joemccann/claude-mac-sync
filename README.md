@@ -259,7 +259,7 @@ Every `--push` and `--pull` operation creates a timestamped backup before making
 ~/.claude_backup.20250128_143022/
 ```
 
-**Smart Backup Cleanup**: Backups are automatically deleted after sync if no files actually changed. This prevents accumulation of identical backup folders while preserving the safety guarantee during the sync operation.
+**Smart Backup Cleanup** (v0.4.0+): Backups are automatically deleted after sync if **synced files** haven't changed. The daemon only compares the files it actually syncs (settings.json, mcp.json, CLAUDE.md, skills/, plugins/) and ignores non-synced files like debug logs, file-history, and todos. This prevents accumulation of unnecessary backups while preserving the safety guarantee during sync operations.
 
 Manual backup:
 ```bash
@@ -283,9 +283,41 @@ claude-sync-undo
 
 Clean up redundant backups:
 ```bash
-# Remove backup folders that have identical content to the next backup
-# (useful for one-time cleanup of accumulated backups)
+# Remove old backups (keeps 10 most recent) and Dropbox conflict files
+./cleanup-backups-simple.sh 10 false
+
+# Dry run first (preview what will be removed)
+./cleanup-backups-simple.sh 10 true
+
+# Or use the built-in command (compares synced files only)
 ./claude-sync-setup.sh --cleanup-backups
+```
+
+### Backup Accumulation Fix (v0.4.0)
+
+**Problem:** Prior to v0.4.0, the daemon created backups on every sync and compared the **entire** `~/.claude` directory when deciding whether to keep them. This caused backups to accumulate because Claude Code constantly modifies non-synced files (debug logs, file-history, todos, etc.), even when no synced files changed.
+
+**Solution:** As of v0.4.0, the backup logic only compares **synced files** (settings.json, mcp.json, CLAUDE.md, skills/, plugins/). This means:
+- Backups are created before each sync (safety first)
+- Backups are immediately removed if synced files haven't changed
+- Changes to debug/, file-history/, todos/ etc. no longer trigger backup retention
+- Prevents unnecessary backup accumulation
+
+**Upgrading from older versions:**
+```bash
+# 1. Stop daemon
+./claude-sync-daemon.sh stop
+
+# 2. Pull latest version
+git pull origin main
+
+# 3. Clean up accumulated backups
+./cleanup-backups-simple.sh 10 false
+
+# 4. Reinstall daemon
+./claude-sync-daemon.sh install
+
+# See UNINSTALL.md for complete cleanup instructions
 ```
 
 ---
@@ -332,13 +364,15 @@ Run `--pull` to replace symlinks with real files.
 |------|---------|
 | `claude-sync-setup.sh` | Main sync script |
 | `claude-sync-daemon.sh` | Daemon control script |
+| `cleanup-backups-simple.sh` | Fast cleanup for backups and Dropbox conflicts |
 | `zshrc-functions.sh` | Shell functions for quick access |
 | `watch/` | Rust source for file watcher daemon |
+| `test_sync.sh` | Test suite for integrity validation |
+| `UNINSTALL.md` | Complete uninstall instructions |
 | `~/.claude_sync_config` | Saved Dropbox location (per-machine) |
 | `~/.claude_backup.*` | Timestamped backups |
 | `~/.claude_sync_last_backup` | Marker for undo functionality |
 | `~/.claude_sync_logs/` | Daemon log files |
-| `test_sync.sh` | Test suite for integrity validation |
 
 ---
 
