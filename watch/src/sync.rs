@@ -151,10 +151,17 @@ impl SyncEngine {
             skipped
         );
 
+        // Cleanup backup if no changes were made
+        let final_backup_path = if cleanup_backup_if_unchanged(&backup_path, &self.config.claude_dir) {
+            None // Backup was removed
+        } else {
+            Some(backup_path) // Backup was kept
+        };
+
         Ok(SyncResult {
             copied,
             skipped,
-            backup_path: Some(backup_path),
+            backup_path: final_backup_path,
             warnings,
         })
     }
@@ -396,4 +403,84 @@ fn walkdir(dir: &Path) -> Vec<PathBuf> {
     }
 
     results
+}
+
+/// Check if two directories have identical content
+fn dirs_are_identical(dir1: &Path, dir2: &Path) -> bool {
+    if !dir1.exists() || !dir2.exists() {
+        return false;
+    }
+
+    let files1 = walkdir(dir1);
+    let files2 = walkdir(dir2);
+
+    // Quick check: file counts
+    if files1.len() != files2.len() {
+        return false;
+    }
+
+    // Compare each file's checksum
+    for file1 in &files1 {
+        let rel_path = match file1.strip_prefix(dir1) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        let file2 = dir2.join(rel_path);
+
+        if !file2.exists() {
+            return false;
+        }
+
+        // Compare checksums
+        let hash1 = match sha256_file(file1) {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
+        let hash2 = match sha256_file(&file2) {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
+
+        if hash1 != hash2 {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Remove backup if identical to current state (no changes occurred)
+fn cleanup_backup_if_unchanged(backup_path: &Path, claude_dir: &Path) -> bool {
+    if !backup_path.exists() {
+        return false;
+    }
+
+    if dirs_are_identical(backup_path, claude_dir) {
+        log::info!(
+            "No changes detected, removing unnecessary backup: {:?}",
+            backup_path
+        );
+
+        if let Err(e) = fs::remove_dir_all(backup_path) {
+            log::warn!("Failed to remove backup: {}", e);
+            return false;
+        }
+
+        // Clear last backup marker if it pointed to this backup
+        let last_backup_file = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(".claude_sync_last_backup");
+
+        if last_backup_file.exists() {
+            if let Ok(stored) = fs::read_to_string(&last_backup_file) {
+                if stored.trim() == backup_path.to_string_lossy() {
+                    let _ = fs::remove_file(&last_backup_file);
+                }
+            }
+        }
+
+        return true; // Backup was removed
+    }
+
+    false // Backup was kept
 }

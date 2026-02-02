@@ -35,6 +35,52 @@ _claude_sync_validate_dir() {
     [[ "$src_count" == "$dst_count" ]]
 }
 
+# Check if two directories have identical content (for backup comparison)
+_claude_sync_dirs_identical() {
+    local dir1="$1" dir2="$2"
+    [[ -d "$dir1" && -d "$dir2" ]] || return 1
+
+    # Quick check: file counts
+    local count1=$(find "$dir1" -type f | wc -l | tr -d ' ')
+    local count2=$(find "$dir2" -type f | wc -l | tr -d ' ')
+    [[ "$count1" == "$count2" ]] || return 1
+
+    # Compare each file's checksum
+    while IFS= read -r -d '' file; do
+        local rel_path="${file#$dir1/}"
+        local other_file="$dir2/$rel_path"
+        [[ -f "$other_file" ]] || return 1
+
+        local sum1=$(shasum -a 256 "$file" 2>/dev/null | cut -d' ' -f1)
+        local sum2=$(shasum -a 256 "$other_file" 2>/dev/null | cut -d' ' -f1)
+        [[ "$sum1" == "$sum2" ]] || return 1
+    done < <(find "$dir1" -type f -print0)
+
+    return 0
+}
+
+# Remove backup if identical to current state
+_claude_sync_cleanup_backup() {
+    local backup_path="$1"
+    [[ -z "$backup_path" || ! -d "$backup_path" ]] && return 0
+
+    if _claude_sync_dirs_identical "$backup_path" "$CLAUDE_SYNC_LOCAL_DIR"; then
+        echo "\033[0;34m[INFO]\033[0m No changes detected, removing unnecessary backup"
+        rm -rf "$backup_path"
+
+        # Clear last backup marker if it pointed to this backup
+        local last_backup_file="$HOME/.claude_sync_last_backup"
+        if [[ -f "$last_backup_file" ]]; then
+            local stored_backup=$(cat "$last_backup_file")
+            if [[ "$stored_backup" == "$backup_path" ]]; then
+                rm -f "$last_backup_file"
+            fi
+        fi
+        return 0  # Backup was removed
+    fi
+    return 1  # Backup was kept
+}
+
 _claude_sync_safe_copy_file() {
     local src="$1" dst="$2" is_json="${3:-false}"
 
@@ -314,7 +360,10 @@ claude-sync-pull() {
         echo "\033[1;33m[HINT]\033[0m Run 'claude-sync-undo' to restore previous state"
         return 1
     else
-        echo "\033[0;32m[OK]\033[0m Pull complete. Run 'claude-sync-undo' to revert if needed."
+        echo "\033[0;32m[OK]\033[0m Pull complete."
+
+        # Cleanup backup if no changes were made
+        _claude_sync_cleanup_backup "$backup_path"
     fi
 }
 
